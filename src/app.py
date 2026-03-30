@@ -8,6 +8,9 @@ for extracurricular activities at Mergington High School.
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+import hashlib
+import re
 import os
 from pathlib import Path
 import sqlite3
@@ -106,7 +109,8 @@ def init_db():
 
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
         email TEXT PRIMARY KEY,
-        full_name TEXT
+        full_name TEXT,
+        password_hash TEXT
     )""")
 
     for name, act in DEFAULT_ACTIVITIES.items():
@@ -124,6 +128,36 @@ def init_db():
     conn.close()
 
 
+class SignupRequest(BaseModel):
+    email: str
+    full_name: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def is_password_valid(password: str) -> bool:
+    # at least 8 chars, 1 upper, 1 lower, 1 digit, and 1 special char
+    if len(password) < 8:
+        return False
+    if not re.search(r"[A-Z]", password):
+        return False
+    if not re.search(r"[a-z]", password):
+        return False
+    if not re.search(r"[0-9]", password):
+        return False
+    if not re.search(r"[^A-Za-z0-9]", password):
+        return False
+    return True
+
+
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -132,6 +166,72 @@ def on_startup():
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.post("/auth/signup")
+def auth_signup(payload: SignupRequest):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    existing = cur.execute("SELECT 1 FROM users WHERE email = ?", (payload.email,)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    if not is_password_valid(payload.password):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters and include uppercase, lowercase, digit, and special character")
+
+    password_hash = hash_password(payload.password)
+    cur.execute("INSERT INTO users (email, full_name, password_hash) VALUES (?, ?, ?)",
+                (payload.email, payload.full_name, password_hash))
+    conn.commit()
+    conn.close()
+
+    return {"message": "Signup successful"}
+
+
+@app.post("/auth/login")
+def auth_login(payload: LoginRequest):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    user = cur.execute("SELECT password_hash FROM users WHERE email = ?", (payload.email,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if hash_password(payload.password) != user["password_hash"]:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    conn.close()
+    return {"message": "Login successful"}
+
+
+@app.post("/auth/change-password")
+def auth_change_password(payload: LoginRequest, new_password: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    user = cur.execute("SELECT password_hash FROM users WHERE email = ?", (payload.email,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if hash_password(payload.password) != user["password_hash"]:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid current password")
+
+    if not is_password_valid(new_password):
+        conn.close()
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters and include uppercase, lowercase, digit, and special character")
+
+    cur.execute("UPDATE users SET password_hash = ? WHERE email = ?", (hash_password(new_password), payload.email))
+    conn.commit()
+    conn.close()
+
+    return {"message": "Password changed successfully"}
 
 
 @app.get("/activities")
